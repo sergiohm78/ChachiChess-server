@@ -166,7 +166,26 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			"Mensaje recibido: %s",
 			string(mensaje),
 		)
+if string(mensaje) == "ABANDONAR" {
+    g.Mu.Lock()
 
+    for cliente := range g.Clients {
+        if cliente == ws {
+            _ = cliente.WriteMessage(
+                websocket.TextMessage,
+                []byte("RESULTADO:Has abandonado"),
+            )
+        } else {
+            _ = cliente.WriteMessage(
+                websocket.TextMessage,
+                []byte("RESULTADO:Victoria por abandono"),
+            )
+        }
+    }
+
+    g.Mu.Unlock()
+    continue
+}
 		uci, err := movimientoUCI(string(mensaje))
 		if err != nil {
 			log.Printf(
