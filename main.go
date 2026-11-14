@@ -80,6 +80,11 @@ func iniciarBD(cadena string) error {
 		return err
 	}
 
+	// Neon suspende el cálculo tras 5 minutos sin uso: se cierran antes
+	// las conexiones inactivas para no reutilizar una que ya no sirve.
+	db.SetConnMaxIdleTime(3 * time.Minute)
+	db.SetConnMaxLifetime(30 * time.Minute)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -104,15 +109,18 @@ func iniciarBD(cadena string) error {
 // guardarPartida escribe el estado de la partida en la base de datos.
 // Debe llamarse con g.Mu bloqueado (o antes de publicar la partida),
 // para que los guardados de una misma partida se hagan en orden.
+// Si falla, se reintenta una vez.
 func guardarPartida(g *Game) {
 	if db == nil {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	var err error
 
-	_, err := db.ExecContext(ctx, `INSERT INTO partidas
+	for intento := 1; intento <= 2; intento++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		_, err = db.ExecContext(ctx, `INSERT INTO partidas
 	(codigo, blancas, negras, movimientos, terminada, resultado, abandona, actualizada)
 VALUES ($1, $2, $3, $4, $5, $6, $7, now())
 ON CONFLICT (codigo) DO UPDATE SET
@@ -123,17 +131,22 @@ ON CONFLICT (codigo) DO UPDATE SET
 	resultado = EXCLUDED.resultado,
 	abandona = EXCLUDED.abandona,
 	actualizada = now()`,
-		g.Code,
-		g.Blancas,
-		g.Negras,
-		strings.Join(g.Movimientos, ","),
-		g.Terminada,
-		g.Resultado,
-		int(g.Abandona),
-	)
+			g.Code,
+			g.Blancas,
+			g.Negras,
+			strings.Join(g.Movimientos, ","),
+			g.Terminada,
+			g.Resultado,
+			int(g.Abandona),
+		)
 
-	if err != nil {
-		log.Printf("Error guardando partida %s: %v", g.Code, err)
+		cancel()
+
+		if err == nil {
+			return
+		}
+
+		log.Printf("Error guardando partida %s (intento %d): %v", g.Code, intento, err)
 	}
 }
 
@@ -247,7 +260,7 @@ func main() {
 func movimientoUCI(mensaje string) (string, error) {
 	partes := strings.Split(mensaje, "-")
 
-	if len(partes) != 2 {
+	if len(partes) != 2 && len(partes) != 3 {
 		return "", fmt.Errorf("movimiento incorrecto")
 	}
 
@@ -280,7 +293,19 @@ func movimientoUCI(mensaje string) (string, error) {
 	destinoUCI := string(rune('a'+columnaDestino)) +
 		strconv.Itoa(8-filaDestino)
 
-	return origenUCI + destinoUCI, nil
+	resultado := origenUCI + destinoUCI
+
+	// Tercer campo opcional: pieza de coronación (q, r, b, n).
+	if len(partes) == 3 {
+		switch partes[2] {
+		case "q", "r", "b", "n":
+			resultado += partes[2]
+		default:
+			return "", fmt.Errorf("pieza de coronación incorrecta")
+		}
+	}
+
+	return resultado, nil
 }
 
 // nombreColor devuelve "white" o "black", que es lo que entiende la app.
@@ -608,6 +633,14 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			_ = cliente.WriteMessage(
 				websocket.TextMessage,
 				mensaje,
+			)
+		}
+
+		// Posición completa tras el movimiento (corrige enroque, captura al paso y coronación).
+		for cliente := range g.Clients {
+			_ = cliente.WriteMessage(
+				websocket.TextMessage,
+				[]byte("TABLERO|"+g.Game.FEN()),
 			)
 		}
 
