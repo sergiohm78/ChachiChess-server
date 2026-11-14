@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,14 @@ type Game struct {
 	Game    *chess.Game
 	Clients map[*websocket.Conn]bool
 	Mu      sync.Mutex
+
+	// Datos añadidos para poder reanudar partidas.
+	Blancas     string      // jugadorId del jugador de blancas
+	Negras      string      // jugadorId del jugador de negras
+	Movimientos []string    // historial de movimientos en formato UCI (e2e4, g1f3...)
+	Terminada   bool        // true cuando hay jaque mate, tablas o abandono
+	Resultado   string      // "Jaque mate", "Tablas" o "Abandono"
+	Abandona    chess.Color // color del jugador que abandonó
 }
 
 var games = struct {
@@ -53,8 +62,14 @@ func main() {
 	http.HandleFunc("/game", gameHandler)
 	http.HandleFunc("/game/", gameHandler)
 
-	log.Println("Servidor escuchando en :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	puerto := os.Getenv("PORT")
+
+	if puerto == "" {
+		puerto = "8080"
+	}
+
+	log.Printf("Servidor escuchando en :%s", puerto)
+	log.Fatal(http.ListenAndServe(":"+puerto, nil))
 }
 
 func movimientoUCI(mensaje string) (string, error) {
@@ -94,6 +109,35 @@ func movimientoUCI(mensaje string) (string, error) {
 		strconv.Itoa(8-filaDestino)
 
 	return origenUCI + destinoUCI, nil
+}
+
+// nombreColor devuelve "white" o "black", que es lo que entiende la app.
+func nombreColor(c chess.Color) string {
+	if c == chess.White {
+		return "white"
+	}
+	return "black"
+}
+
+// snapshotPartida construye el mensaje de estado completo:
+// ESTADO|COLOR|FEN|MOVIMIENTOS
+// La FEN contiene la posición y de quién es el turno.
+// Debe llamarse con g.Mu bloqueado.
+func snapshotPartida(g *Game, color chess.Color) string {
+	return "ESTADO|" + nombreColor(color) + "|" + g.Game.FEN() + "|" +
+		strings.Join(g.Movimientos, ",")
+}
+
+// textoResultado devuelve el texto del resultado para un jugador concreto.
+// Debe llamarse con g.Mu bloqueado.
+func textoResultado(g *Game, color chess.Color) string {
+	if g.Resultado == "Abandono" {
+		if g.Abandona == color {
+			return "Has abandonado"
+		}
+		return "Victoria por abandono"
+	}
+	return g.Resultado
 }
 
 func gameHandler(w http.ResponseWriter, r *http.Request) {
@@ -140,14 +184,70 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jugadorID := strings.TrimSpace(r.URL.Query().Get("jugador"))
+	if jugadorID == "" {
+		http.Error(
+			w,
+			"falta el identificador del jugador",
+			http.StatusBadRequest,
+		)
+		return
+	}
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 
+	// Identificar al jugador: si ya es uno de los dos, recupera su color;
+	// si no, ocupa el primer hueco libre; si no hay hueco, se rechaza.
 	g.Mu.Lock()
+
+	var miColor chess.Color
+
+	switch {
+	case jugadorID == g.Blancas:
+		miColor = chess.White
+	case jugadorID == g.Negras:
+		miColor = chess.Black
+	case g.Blancas == "":
+		g.Blancas = jugadorID
+		miColor = chess.White
+	case g.Negras == "":
+		g.Negras = jugadorID
+		miColor = chess.Black
+	default:
+		g.Mu.Unlock()
+		_ = ws.WriteMessage(
+			websocket.TextMessage,
+			[]byte("RECHAZADO:La partida ya tiene dos jugadores"),
+		)
+		_ = ws.Close()
+		return
+	}
+
 	g.Clients[ws] = true
+
+	// Estado completo de la partida para este jugador.
+	_ = ws.WriteMessage(
+		websocket.TextMessage,
+		[]byte(snapshotPartida(g, miColor)),
+	)
+
+	if g.Terminada {
+		_ = ws.WriteMessage(
+			websocket.TextMessage,
+			[]byte("RESULTADO:"+textoResultado(g, miColor)),
+		)
+	}
+
 	g.Mu.Unlock()
+
+	log.Printf(
+		"Jugador conectado a %s como %s",
+		g.Code,
+		nombreColor(miColor),
+	)
 
 	defer func() {
 		g.Mu.Lock()
@@ -166,26 +266,34 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			"Mensaje recibido: %s",
 			string(mensaje),
 		)
-if string(mensaje) == "ABANDONAR" {
-    g.Mu.Lock()
 
-    for cliente := range g.Clients {
-        if cliente == ws {
-            _ = cliente.WriteMessage(
-                websocket.TextMessage,
-                []byte("RESULTADO:Has abandonado"),
-            )
-        } else {
-            _ = cliente.WriteMessage(
-                websocket.TextMessage,
-                []byte("RESULTADO:Victoria por abandono"),
-            )
-        }
-    }
+		if string(mensaje) == "ABANDONAR" {
+			g.Mu.Lock()
 
-    g.Mu.Unlock()
-    continue
-}
+			if !g.Terminada {
+				g.Terminada = true
+				g.Resultado = "Abandono"
+				g.Abandona = miColor
+
+				for cliente := range g.Clients {
+					if cliente == ws {
+						_ = cliente.WriteMessage(
+							websocket.TextMessage,
+							[]byte("RESULTADO:Has abandonado"),
+						)
+					} else {
+						_ = cliente.WriteMessage(
+							websocket.TextMessage,
+							[]byte("RESULTADO:Victoria por abandono"),
+						)
+					}
+				}
+			}
+
+			g.Mu.Unlock()
+			continue
+		}
+
 		uci, err := movimientoUCI(string(mensaje))
 		if err != nil {
 			log.Printf(
@@ -193,14 +301,36 @@ if string(mensaje) == "ABANDONAR" {
 				err,
 			)
 
+			g.Mu.Lock()
 			_ = ws.WriteMessage(
 				websocket.TextMessage,
 				[]byte("ERROR:Movimiento no permitido"),
 			)
+			g.Mu.Unlock()
 			continue
 		}
 
 		g.Mu.Lock()
+
+		if g.Terminada {
+			_ = ws.WriteMessage(
+				websocket.TextMessage,
+				[]byte("ERROR:La partida ha terminado"),
+			)
+
+			g.Mu.Unlock()
+			continue
+		}
+
+		if g.Game.Position().Turn() != miColor {
+			_ = ws.WriteMessage(
+				websocket.TextMessage,
+				[]byte("ERROR:No es tu turno"),
+			)
+
+			g.Mu.Unlock()
+			continue
+		}
 
 		var movimiento *chess.Move
 
@@ -246,6 +376,8 @@ if string(mensaje) == "ABANDONAR" {
 			continue
 		}
 
+		g.Movimientos = append(g.Movimientos, uci)
+
 		notacion := chess.AlgebraicNotation{}.Encode(
 			posicionAnterior,
 			movimiento,
@@ -266,9 +398,13 @@ if string(mensaje) == "ABANDONAR" {
 		switch {
 		case g.Game.Method() == chess.Checkmate:
 			mensajeEstado = "RESULTADO:Jaque mate"
+			g.Terminada = true
+			g.Resultado = "Jaque mate"
 
 		case g.Game.Method() == chess.Stalemate:
 			mensajeEstado = "RESULTADO:Tablas"
+			g.Terminada = true
+			g.Resultado = "Tablas"
 
 		case strings.HasSuffix(notacion, "+"):
 			mensajeEstado = "ESTADO:Jaque"
