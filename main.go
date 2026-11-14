@@ -34,6 +34,7 @@ type Game struct {
 	Terminada   bool        // true cuando hay jaque mate, tablas o abandono
 	Resultado   string      // "Jaque mate", "Tablas" o "Abandono"
 	Abandona    chess.Color // color del jugador que abandonó
+	EnJaque     bool        // true si el jugador que tiene el turno está en jaque
 }
 
 var games = struct {
@@ -210,6 +211,36 @@ func limpiarPartidas() {
 	)
 }
 
+// hayJaque indica si el último movimiento de la lista da jaque.
+func hayJaque(movimientos []string) bool {
+	if len(movimientos) == 0 {
+		return false
+	}
+
+	partida := chess.NewGame()
+
+	for _, uci := range movimientos[:len(movimientos)-1] {
+		if !jugarUCI(partida, uci) {
+			return false
+		}
+	}
+
+	ultimo := movimientos[len(movimientos)-1]
+
+	for _, candidato := range partida.ValidMoves() {
+		if candidato.String() == ultimo {
+			notacion := chess.AlgebraicNotation{}.Encode(
+				partida.Position(),
+				candidato,
+			)
+
+			return strings.HasSuffix(notacion, "+")
+		}
+	}
+
+	return false
+}
+
 // jugarUCI aplica un movimiento UCI a una partida si es legal.
 func jugarUCI(partida *chess.Game, uci string) bool {
 	for _, candidato := range partida.ValidMoves() {
@@ -270,6 +301,7 @@ func cargarPartidas() error {
 			Terminada:   terminada,
 			Resultado:   resultado,
 			Abandona:    chess.Color(abandona),
+			EnJaque:     !terminada && hayJaque(aplicados),
 		}
 		games.Unlock()
 
@@ -514,6 +546,13 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
+	if g.EnJaque && !g.Terminada {
+		_ = ws.WriteMessage(
+			websocket.TextMessage,
+			[]byte("ESTADO:Jaque"),
+		)
+	}
+
 	if nuevoJugador {
 		guardarPartida(g)
 	}
@@ -626,9 +665,14 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 				uci,
 			)
 
+			textoError := "ERROR:Movimiento no permitido"
+			if g.EnJaque {
+				textoError = "ERROR:Estás en jaque: protege a tu rey"
+			}
+
 			_ = ws.WriteMessage(
 				websocket.TextMessage,
-				[]byte("ERROR:Movimiento no permitido"),
+				[]byte(textoError),
 			)
 
 			g.Mu.Unlock()
@@ -689,14 +733,7 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			mensajeEstado = "ESTADO:Jaque"
 		}
 
-		if mensajeEstado != "" {
-			for cliente := range g.Clients {
-				_ = cliente.WriteMessage(
-					websocket.TextMessage,
-					[]byte(mensajeEstado),
-				)
-			}
-		}
+		g.EnJaque = !g.Terminada && strings.HasSuffix(notacion, "+")
 
 		for cliente := range g.Clients {
 			_ = cliente.WriteMessage(
@@ -711,6 +748,16 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 				websocket.TextMessage,
 				[]byte("TABLERO|"+g.Game.FEN()),
 			)
+		}
+
+		// El aviso de jaque o el resultado van después del movimiento.
+		if mensajeEstado != "" {
+			for cliente := range g.Clients {
+				_ = cliente.WriteMessage(
+					websocket.TextMessage,
+					[]byte(mensajeEstado),
+				)
+			}
 		}
 
 		// Se guarda después de enviar el movimiento, para no retrasar al rival.
