@@ -154,23 +154,23 @@ ON CONFLICT (codigo) DO UPDATE SET
 // Así un jugador que cierre la app puede ver el resultado al volver.
 const diasConservarTerminadas = 7
 
-// limpiarPartidasTerminadas borra de la base de datos y de la memoria
-// las partidas terminadas hace más de diasConservarTerminadas días.
-func limpiarPartidasTerminadas() {
-	if db == nil {
-		return
-	}
+// Días que se conserva una partida en la que nadie ha movido ninguna pieza.
+// Las partidas ya empezadas y sin terminar no se borran nunca.
+const diasConservarSinMovimientos = 14
 
+// borrarPartidas borra de la base de datos y de la memoria las partidas
+// que cumplan la condición SQL indicada y devuelve cuántas ha borrado.
+func borrarPartidas(condicion string, dias int) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	rows, err := db.QueryContext(ctx, `DELETE FROM partidas
-WHERE terminada = TRUE
+WHERE `+condicion+`
 AND actualizada < now() - make_interval(days => $1::int)
-RETURNING codigo`, diasConservarTerminadas)
+RETURNING codigo`, dias)
 	if err != nil {
 		log.Printf("Error en la limpieza de partidas: %v", err)
-		return
+		return 0
 	}
 	defer rows.Close()
 
@@ -190,7 +190,24 @@ RETURNING codigo`, diasConservarTerminadas)
 		borradas++
 	}
 
-	log.Printf("Limpieza: %d partidas terminadas borradas", borradas)
+	return borradas
+}
+
+// limpiarPartidas borra las partidas terminadas antiguas y las que
+// se crearon y nunca se jugaron.
+func limpiarPartidas() {
+	if db == nil {
+		return
+	}
+
+	terminadas := borrarPartidas("terminada = TRUE", diasConservarTerminadas)
+	sinJugar := borrarPartidas("terminada = FALSE AND movimientos = ''", diasConservarSinMovimientos)
+
+	log.Printf(
+		"Limpieza: %d partidas terminadas y %d partidas sin jugar borradas",
+		terminadas,
+		sinJugar,
+	)
 }
 
 // jugarUCI aplica un movimiento UCI a una partida si es legal.
@@ -280,10 +297,10 @@ func main() {
 
 		// Limpieza al arrancar y después cada 6 horas.
 		go func() {
-			limpiarPartidasTerminadas()
+			limpiarPartidas()
 
 			for range time.Tick(6 * time.Hour) {
-				limpiarPartidasTerminadas()
+				limpiarPartidas()
 			}
 		}()
 	}
