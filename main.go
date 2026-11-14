@@ -1,18 +1,23 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/notnil/chess"
 )
 
@@ -50,7 +55,174 @@ func code() string {
 	return strings.ToUpper(hex.EncodeToString(b))
 }
 
+// db es nil si no hay DATABASE_URL (en ese caso solo se usa la memoria).
+var db *sql.DB
+
+// limpiarURL quita parámetros de la cadena de Neon que el controlador no necesita.
+func limpiarURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	q := u.Query()
+	q.Del("channel_binding")
+	u.RawQuery = q.Encode()
+
+	return u.String()
+}
+
+func iniciarBD(cadena string) error {
+	var err error
+
+	db, err = sql.Open("pgx", limpiarURL(cadena))
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err = db.PingContext(ctx); err != nil {
+		return err
+	}
+
+	_, err = db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS partidas (
+	codigo TEXT PRIMARY KEY,
+	blancas TEXT NOT NULL DEFAULT '',
+	negras TEXT NOT NULL DEFAULT '',
+	movimientos TEXT NOT NULL DEFAULT '',
+	terminada BOOLEAN NOT NULL DEFAULT FALSE,
+	resultado TEXT NOT NULL DEFAULT '',
+	abandona INTEGER NOT NULL DEFAULT 0,
+	actualizada TIMESTAMPTZ NOT NULL DEFAULT now()
+)`)
+
+	return err
+}
+
+// guardarPartida escribe el estado de la partida en la base de datos.
+// Debe llamarse con g.Mu bloqueado (o antes de publicar la partida),
+// para que los guardados de una misma partida se hagan en orden.
+func guardarPartida(g *Game) {
+	if db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := db.ExecContext(ctx, `INSERT INTO partidas
+	(codigo, blancas, negras, movimientos, terminada, resultado, abandona, actualizada)
+VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+ON CONFLICT (codigo) DO UPDATE SET
+	blancas = EXCLUDED.blancas,
+	negras = EXCLUDED.negras,
+	movimientos = EXCLUDED.movimientos,
+	terminada = EXCLUDED.terminada,
+	resultado = EXCLUDED.resultado,
+	abandona = EXCLUDED.abandona,
+	actualizada = now()`,
+		g.Code,
+		g.Blancas,
+		g.Negras,
+		strings.Join(g.Movimientos, ","),
+		g.Terminada,
+		g.Resultado,
+		int(g.Abandona),
+	)
+
+	if err != nil {
+		log.Printf("Error guardando partida %s: %v", g.Code, err)
+	}
+}
+
+// jugarUCI aplica un movimiento UCI a una partida si es legal.
+func jugarUCI(partida *chess.Game, uci string) bool {
+	for _, candidato := range partida.ValidMoves() {
+		if candidato.String() == uci {
+			return partida.Move(candidato) == nil
+		}
+	}
+
+	return false
+}
+
+// cargarPartidas recupera todas las partidas guardadas al arrancar,
+// rehaciendo cada una a partir de su historial de movimientos.
+func cargarPartidas() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `SELECT codigo, blancas, negras, movimientos, terminada, resultado, abandona FROM partidas`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	total := 0
+
+	for rows.Next() {
+		var codigo, blancas, negras, movimientos, resultado string
+		var terminada bool
+		var abandona int
+
+		err = rows.Scan(&codigo, &blancas, &negras, &movimientos, &terminada, &resultado, &abandona)
+		if err != nil {
+			return err
+		}
+
+		partida := chess.NewGame()
+		aplicados := []string{}
+
+		if movimientos != "" {
+			for _, uci := range strings.Split(movimientos, ",") {
+				if !jugarUCI(partida, uci) {
+					log.Printf("Partida %s: movimiento %s no se pudo rehacer", codigo, uci)
+					break
+				}
+
+				aplicados = append(aplicados, uci)
+			}
+		}
+
+		games.Lock()
+		games.m[codigo] = &Game{
+			Code:        codigo,
+			Game:        partida,
+			Clients:     make(map[*websocket.Conn]bool),
+			Blancas:     blancas,
+			Negras:      negras,
+			Movimientos: aplicados,
+			Terminada:   terminada,
+			Resultado:   resultado,
+			Abandona:    chess.Color(abandona),
+		}
+		games.Unlock()
+
+		total++
+	}
+
+	log.Printf("Partidas recuperadas de la base de datos: %d", total)
+
+	return rows.Err()
+}
+
 func main() {
+	cadena := os.Getenv("DATABASE_URL")
+
+	if cadena == "" {
+		log.Println("AVISO: no hay DATABASE_URL; las partidas solo se guardan en memoria")
+	} else {
+		if err := iniciarBD(cadena); err != nil {
+			log.Fatalf("No se pudo conectar con la base de datos: %v", err)
+		}
+
+		if err := cargarPartidas(); err != nil {
+			log.Fatalf("No se pudieron cargar las partidas: %v", err)
+		}
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("Servidor de ajedrez activo"))
 	})
@@ -144,12 +316,16 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		c := code()
 
-		games.Lock()
-		games.m[c] = &Game{
+		nueva := &Game{
 			Code:    c,
 			Game:    chess.NewGame(),
 			Clients: make(map[*websocket.Conn]bool),
 		}
+
+		guardarPartida(nueva)
+
+		games.Lock()
+		games.m[c] = nueva
 		games.Unlock()
 
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -204,6 +380,7 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 	g.Mu.Lock()
 
 	var miColor chess.Color
+	nuevoJugador := false
 
 	switch {
 	case jugadorID == g.Blancas:
@@ -213,9 +390,11 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 	case g.Blancas == "":
 		g.Blancas = jugadorID
 		miColor = chess.White
+		nuevoJugador = true
 	case g.Negras == "":
 		g.Negras = jugadorID
 		miColor = chess.Black
+		nuevoJugador = true
 	default:
 		g.Mu.Unlock()
 		_ = ws.WriteMessage(
@@ -239,6 +418,10 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			websocket.TextMessage,
 			[]byte("RESULTADO:"+textoResultado(g, miColor)),
 		)
+	}
+
+	if nuevoJugador {
+		guardarPartida(g)
 	}
 
 	g.Mu.Unlock()
@@ -288,6 +471,8 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 						)
 					}
 				}
+
+				guardarPartida(g)
 			}
 
 			g.Mu.Unlock()
@@ -425,6 +610,9 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 				mensaje,
 			)
 		}
+
+		// Se guarda después de enviar el movimiento, para no retrasar al rival.
+		guardarPartida(g)
 
 		g.Mu.Unlock()
 	}
