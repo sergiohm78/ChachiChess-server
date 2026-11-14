@@ -16,9 +16,12 @@ import (
 	"sync"
 	"time"
 
+	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/gorilla/websocket"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/notnil/chess"
+	"google.golang.org/api/option"
 )
 
 type Game struct {
@@ -35,6 +38,10 @@ type Game struct {
 	Resultado   string      // "Jaque mate", "Tablas" o "Abandono"
 	Abandona    chess.Color // color del jugador que abandonó
 	EnJaque     bool        // true si el jugador que tiene el turno está en jaque
+
+	// Identificadores de notificaciones (Firebase) de cada jugador.
+	TokenBlancas string
+	TokenNegras  string
 }
 
 var games = struct {
@@ -103,8 +110,21 @@ func iniciarBD(cadena string) error {
 	abandona INTEGER NOT NULL DEFAULT 0,
 	actualizada TIMESTAMPTZ NOT NULL DEFAULT now()
 )`)
+	if err != nil {
+		return err
+	}
 
-	return err
+	for _, columna := range []string{"token_blancas", "token_negras"} {
+		_, err = db.ExecContext(
+			ctx,
+			"ALTER TABLE partidas ADD COLUMN IF NOT EXISTS "+columna+" TEXT NOT NULL DEFAULT ''",
+		)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // guardarPartida escribe el estado de la partida en la base de datos.
@@ -122,8 +142,8 @@ func guardarPartida(g *Game) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 
 		_, err = db.ExecContext(ctx, `INSERT INTO partidas
-	(codigo, blancas, negras, movimientos, terminada, resultado, abandona, actualizada)
-VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+	(codigo, blancas, negras, movimientos, terminada, resultado, abandona, token_blancas, token_negras, actualizada)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
 ON CONFLICT (codigo) DO UPDATE SET
 	blancas = EXCLUDED.blancas,
 	negras = EXCLUDED.negras,
@@ -131,6 +151,8 @@ ON CONFLICT (codigo) DO UPDATE SET
 	terminada = EXCLUDED.terminada,
 	resultado = EXCLUDED.resultado,
 	abandona = EXCLUDED.abandona,
+	token_blancas = EXCLUDED.token_blancas,
+	token_negras = EXCLUDED.token_negras,
 	actualizada = now()`,
 			g.Code,
 			g.Blancas,
@@ -139,6 +161,8 @@ ON CONFLICT (codigo) DO UPDATE SET
 			g.Terminada,
 			g.Resultado,
 			int(g.Abandona),
+			g.TokenBlancas,
+			g.TokenNegras,
 		)
 
 		cancel()
@@ -241,6 +265,90 @@ func hayJaque(movimientos []string) bool {
 	return false
 }
 
+// clienteFCM es nil si no hay FIREBASE_CREDENTIALS (no se envían notificaciones).
+var clienteFCM *messaging.Client
+
+func iniciarFirebase(credenciales string) error {
+	ctx := context.Background()
+
+	app, err := firebase.NewApp(ctx, nil, option.WithCredentialsJSON([]byte(credenciales)))
+	if err != nil {
+		return err
+	}
+
+	clienteFCM, err = app.Messaging(ctx)
+
+	return err
+}
+
+// borrarToken elimina un token que Firebase ha dado por inválido.
+func borrarToken(codigo string, color chess.Color, token string) {
+	games.RLock()
+	g := games.m[codigo]
+	games.RUnlock()
+
+	if g == nil {
+		return
+	}
+
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+
+	if color == chess.White && g.TokenBlancas == token {
+		g.TokenBlancas = ""
+		guardarPartida(g)
+	}
+
+	if color == chess.Black && g.TokenNegras == token {
+		g.TokenNegras = ""
+		guardarPartida(g)
+	}
+}
+
+// enviarAviso manda una notificación al móvil del jugador indicado.
+// Se envía en segundo plano para no retrasar la partida.
+// Si la app está abierta en ese móvil, Android no muestra el aviso.
+func enviarAviso(g *Game, color chess.Color, texto string) {
+	if clienteFCM == nil {
+		return
+	}
+
+	token := g.TokenBlancas
+	if color == chess.Black {
+		token = g.TokenNegras
+	}
+
+	if token == "" {
+		return
+	}
+
+	go func(codigo string, color chess.Color, token string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		_, err := clienteFCM.Send(ctx, &messaging.Message{
+			Token: token,
+			Notification: &messaging.Notification{
+				Title: "ChachiChess",
+				Body:  texto,
+			},
+			Android: &messaging.AndroidConfig{
+				Priority: "high",
+				Notification: &messaging.AndroidNotification{
+					ChannelID: "turnos",
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("Error enviando notificación (%s): %v", codigo, err)
+
+			if messaging.IsUnregistered(err) {
+				borrarToken(codigo, color, token)
+			}
+		}
+	}(g.Code, color, token)
+}
+
 // jugarUCI aplica un movimiento UCI a una partida si es legal.
 func jugarUCI(partida *chess.Game, uci string) bool {
 	for _, candidato := range partida.ValidMoves() {
@@ -258,7 +366,7 @@ func cargarPartidas() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	rows, err := db.QueryContext(ctx, `SELECT codigo, blancas, negras, movimientos, terminada, resultado, abandona FROM partidas`)
+	rows, err := db.QueryContext(ctx, `SELECT codigo, blancas, negras, movimientos, terminada, resultado, abandona, token_blancas, token_negras FROM partidas`)
 	if err != nil {
 		return err
 	}
@@ -267,11 +375,11 @@ func cargarPartidas() error {
 	total := 0
 
 	for rows.Next() {
-		var codigo, blancas, negras, movimientos, resultado string
+		var codigo, blancas, negras, movimientos, resultado, tokenBlancas, tokenNegras string
 		var terminada bool
 		var abandona int
 
-		err = rows.Scan(&codigo, &blancas, &negras, &movimientos, &terminada, &resultado, &abandona)
+		err = rows.Scan(&codigo, &blancas, &negras, &movimientos, &terminada, &resultado, &abandona, &tokenBlancas, &tokenNegras)
 		if err != nil {
 			return err
 		}
@@ -302,6 +410,9 @@ func cargarPartidas() error {
 			Resultado:   resultado,
 			Abandona:    chess.Color(abandona),
 			EnJaque:     !terminada && hayJaque(aplicados),
+
+			TokenBlancas: tokenBlancas,
+			TokenNegras:  tokenNegras,
 		}
 		games.Unlock()
 
@@ -335,6 +446,16 @@ func main() {
 				limpiarPartidas()
 			}
 		}()
+	}
+
+	credenciales := os.Getenv("FIREBASE_CREDENTIALS")
+
+	if credenciales == "" {
+		log.Println("AVISO: no hay FIREBASE_CREDENTIALS; no se enviarán notificaciones")
+	} else if err := iniciarFirebase(credenciales); err != nil {
+		log.Printf("Firebase no disponible, no se enviarán notificaciones: %v", err)
+	} else {
+		log.Println("Notificaciones Firebase activadas")
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -578,6 +699,26 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// El móvil envía su identificador de notificaciones (no se escribe en el log).
+		if strings.HasPrefix(string(mensaje), "TOKEN|") {
+			token := strings.TrimSpace(strings.TrimPrefix(string(mensaje), "TOKEN|"))
+
+			g.Mu.Lock()
+
+			if token != "" {
+				if miColor == chess.White && g.TokenBlancas != token {
+					g.TokenBlancas = token
+					guardarPartida(g)
+				} else if miColor == chess.Black && g.TokenNegras != token {
+					g.TokenNegras = token
+					guardarPartida(g)
+				}
+			}
+
+			g.Mu.Unlock()
+			continue
+		}
+
 		log.Printf(
 			"Mensaje recibido: %s",
 			string(mensaje),
@@ -604,6 +745,13 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 						)
 					}
 				}
+
+				rival := chess.White
+				if miColor == chess.White {
+					rival = chess.Black
+				}
+
+				enviarAviso(g, rival, "Tu rival ha abandonado: has ganado")
 
 				guardarPartida(g)
 			}
@@ -758,6 +906,21 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 					[]byte(mensajeEstado),
 				)
 			}
+		}
+
+		// Notificación al móvil del jugador al que le toca (o al afectado por el resultado).
+		siguiente := g.Game.Position().Turn()
+
+		switch {
+		case g.Resultado == "Jaque mate":
+			enviarAviso(g, siguiente, "Jaque mate: has perdido la partida")
+		case g.Resultado == "Tablas":
+			enviarAviso(g, chess.White, "Tablas")
+			enviarAviso(g, chess.Black, "Tablas")
+		case !g.Terminada && g.EnJaque:
+			enviarAviso(g, siguiente, "¡Estás en jaque! Es tu turno")
+		case !g.Terminada:
+			enviarAviso(g, siguiente, "Es tu turno")
 		}
 
 		// Se guarda después de enviar el movimiento, para no retrasar al rival.
