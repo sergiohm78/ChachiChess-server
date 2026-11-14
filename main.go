@@ -150,6 +150,49 @@ ON CONFLICT (codigo) DO UPDATE SET
 	}
 }
 
+// Días que se conserva una partida terminada antes de borrarla.
+// Así un jugador que cierre la app puede ver el resultado al volver.
+const diasConservarTerminadas = 7
+
+// limpiarPartidasTerminadas borra de la base de datos y de la memoria
+// las partidas terminadas hace más de diasConservarTerminadas días.
+func limpiarPartidasTerminadas() {
+	if db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	rows, err := db.QueryContext(ctx, `DELETE FROM partidas
+WHERE terminada = TRUE
+AND actualizada < now() - make_interval(days => $1::int)
+RETURNING codigo`, diasConservarTerminadas)
+	if err != nil {
+		log.Printf("Error en la limpieza de partidas: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	borradas := 0
+
+	for rows.Next() {
+		var codigo string
+
+		if rows.Scan(&codigo) != nil {
+			continue
+		}
+
+		games.Lock()
+		delete(games.m, codigo)
+		games.Unlock()
+
+		borradas++
+	}
+
+	log.Printf("Limpieza: %d partidas terminadas borradas", borradas)
+}
+
 // jugarUCI aplica un movimiento UCI a una partida si es legal.
 func jugarUCI(partida *chess.Game, uci string) bool {
 	for _, candidato := range partida.ValidMoves() {
@@ -234,6 +277,15 @@ func main() {
 		if err := cargarPartidas(); err != nil {
 			log.Fatalf("No se pudieron cargar las partidas: %v", err)
 		}
+
+		// Limpieza al arrancar y después cada 6 horas.
+		go func() {
+			limpiarPartidasTerminadas()
+
+			for range time.Tick(6 * time.Hour) {
+				limpiarPartidasTerminadas()
+			}
+		}()
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
