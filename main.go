@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -57,10 +56,18 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// Letras permitidas en el código de partida (sin I ni O, que se confunden con 1 y 0).
+const letrasCodigo = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+// code genera un código de partida: una letra y tres cifras (por ejemplo, F638).
 func code() string {
 	b := make([]byte, 3)
 	_, _ = rand.Read(b)
-	return strings.ToUpper(hex.EncodeToString(b))
+
+	letra := letrasCodigo[int(b[0])%len(letrasCodigo)]
+	numero := (int(b[1])<<8 | int(b[2])) % 1000
+
+	return fmt.Sprintf("%c%03d", letra, numero)
 }
 
 // db es nil si no hay DATABASE_URL (en ese caso solo se usa la memoria).
@@ -561,7 +568,29 @@ func textoResultado(g *Game, color chess.Color) string {
 
 func gameHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		c := code()
+		// Buscar un código que no esté en uso (hay 24.000 combinaciones posibles).
+		games.Lock()
+
+		c := ""
+
+		for intento := 0; intento < 1000; intento++ {
+			candidato := code()
+
+			if games.m[candidato] == nil {
+				c = candidato
+				break
+			}
+		}
+
+		if c == "" {
+			games.Unlock()
+			http.Error(
+				w,
+				"no hay códigos de partida libres",
+				http.StatusServiceUnavailable,
+			)
+			return
+		}
 
 		nueva := &Game{
 			Code:    c,
@@ -569,11 +598,12 @@ func gameHandler(w http.ResponseWriter, r *http.Request) {
 			Clients: make(map[*websocket.Conn]bool),
 		}
 
-		guardarPartida(nueva)
-
-		games.Lock()
 		games.m[c] = nueva
 		games.Unlock()
+
+		nueva.Mu.Lock()
+		guardarPartida(nueva)
+		nueva.Mu.Unlock()
 
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"code": c,
