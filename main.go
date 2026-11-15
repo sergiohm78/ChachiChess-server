@@ -345,7 +345,8 @@ func enviarAviso(g *Game, color chess.Color, texto string) {
 			Android: &messaging.AndroidConfig{
 				Priority: "high",
 				Notification: &messaging.AndroidNotification{
-					ChannelID:   "turnos",
+					ChannelID:   "turnos_v2",
+					Sound:       "aviso_turno",
 					Tag:         codigo,
 					ClickAction: "com.example.chachichess.ABRIR_PARTIDA",
 				},
