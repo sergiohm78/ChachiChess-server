@@ -473,6 +473,7 @@ func main() {
 		_, _ = w.Write([]byte("OK"))
 	})
 
+	http.HandleFunc("/estado", estadoHandler)
 	http.HandleFunc("/game", gameHandler)
 	http.HandleFunc("/game/", gameHandler)
 
@@ -564,6 +565,82 @@ func textoResultado(g *Game, color chess.Color) string {
 		return "Victoria por abandono"
 	}
 	return g.Resultado
+}
+
+type consultaEstado struct {
+	Codigo  string `json:"codigo"`
+	Jugador string `json:"jugador"`
+}
+
+type respuestaEstado struct {
+	Codigo         string `json:"codigo"`
+	Existe         bool   `json:"existe"`
+	TuTurno        bool   `json:"tuTurno"`
+	Terminada      bool   `json:"terminada"`
+	EsperandoRival bool   `json:"esperandoRival"`
+}
+
+// estadoHandler recibe una lista de partidas con el identificador del jugador
+// y devuelve, para cada una, si existe y a quién le toca mover.
+// Solo se dan datos de una partida si el identificador pertenece a uno de sus jugadores.
+func estadoHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var consultas []consultaEstado
+
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&consultas)
+	if err != nil {
+		http.Error(w, "petición incorrecta", http.StatusBadRequest)
+		return
+	}
+
+	if len(consultas) > 100 {
+		consultas = consultas[:100]
+	}
+
+	respuestas := make([]respuestaEstado, 0, len(consultas))
+
+	for _, consulta := range consultas {
+		codigo := strings.ToUpper(strings.TrimSpace(consulta.Codigo))
+		respuesta := respuestaEstado{Codigo: consulta.Codigo}
+
+		games.RLock()
+		g := games.m[codigo]
+		games.RUnlock()
+
+		if g != nil && consulta.Jugador != "" {
+			g.Mu.Lock()
+
+			esJugador := false
+			var color chess.Color
+
+			switch consulta.Jugador {
+			case g.Blancas:
+				esJugador = true
+				color = chess.White
+			case g.Negras:
+				esJugador = true
+				color = chess.Black
+			}
+
+			if esJugador {
+				respuesta.Existe = true
+				respuesta.Terminada = g.Terminada
+				respuesta.EsperandoRival = g.Blancas == "" || g.Negras == ""
+				respuesta.TuTurno = g.Game.Position().Turn() == color
+			}
+
+			g.Mu.Unlock()
+		}
+
+		respuestas = append(respuestas, respuesta)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(respuestas)
 }
 
 func gameHandler(w http.ResponseWriter, r *http.Request) {
