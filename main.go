@@ -336,13 +336,18 @@ func enviarAviso(g *Game, color chess.Color, texto string) {
 		_, err := clienteFCM.Send(ctx, &messaging.Message{
 			Token: token,
 			Notification: &messaging.Notification{
-				Title: "ChachiChess",
+				Title: "ChachiChess · " + codigo,
 				Body:  texto,
+			},
+			Data: map[string]string{
+				"codigo": codigo,
 			},
 			Android: &messaging.AndroidConfig{
 				Priority: "high",
 				Notification: &messaging.AndroidNotification{
-					ChannelID: "turnos",
+					ChannelID:   "turnos",
+					Tag:         codigo,
+					ClickAction: "com.example.chachichess.ABRIR_PARTIDA",
 				},
 			},
 		})
