@@ -59,6 +59,22 @@ var upgrader = websocket.Upgrader{
 // Letras permitidas en el código de partida (sin I ni O, que se confunden con 1 y 0).
 const letrasCodigo = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 
+// nombreValido comprueba el nombre de partida elegido por el jugador:
+// de 3 a 14 caracteres, solo A-Z, 0-9, guion y guion bajo (ya en mayúsculas).
+func nombreValido(n string) bool {
+	if len(n) < 3 || len(n) > 14 {
+		return false
+	}
+
+	for _, r := range n {
+		if !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
+			return false
+		}
+	}
+
+	return true
+}
+
 // code genera un código de partida: una letra y tres cifras (por ejemplo, F638).
 func code() string {
 	b := make([]byte, 3)
@@ -651,17 +667,39 @@ func estadoHandler(w http.ResponseWriter, r *http.Request) {
 
 func gameHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		// Buscar un código que no esté en uso (hay 24.000 combinaciones posibles).
+		// Si el jugador elige nombre (?nombre=XXX) ese será el código de la partida.
+		nombre := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("nombre")))
+
+		if nombre != "" && !nombreValido(nombre) {
+			http.Error(w, "nombre no válido", http.StatusBadRequest)
+			return
+		}
+
 		games.Lock()
 
 		c := ""
 
-		for intento := 0; intento < 1000; intento++ {
-			candidato := code()
+		if nombre != "" {
+			if games.m[nombre] != nil {
+				games.Unlock()
+				http.Error(
+					w,
+					"ya existe una partida con ese nombre",
+					http.StatusConflict,
+				)
+				return
+			}
 
-			if games.m[candidato] == nil {
-				c = candidato
-				break
+			c = nombre
+		} else {
+			// Sin nombre: código aleatorio libre (hay 24.000 combinaciones posibles).
+			for intento := 0; intento < 1000; intento++ {
+				candidato := code()
+
+				if games.m[candidato] == nil {
+					c = candidato
+					break
+				}
 			}
 		}
 
